@@ -33,6 +33,17 @@ class ZstdDictSpec extends AnyFlatSpec {
     bb
   }
 
+  def readFully(is: InputStream): Array[Byte] = {
+    val os  = new ByteArrayOutputStream()
+    val buf = new Array[Byte](16 * 1024)
+    var n   = is.read(buf)
+    while (n >= 0) {
+      os.write(buf, 0, n)
+      n = is.read(buf)
+    }
+    os.toByteArray
+  }
+
   "Zstd" should "report error when failing to make a dict" in {
     val src = source.sliding(28, 28).take(4).map(_.toArray)
     val trainer = new ZstdDictTrainer(1024 * 1024, 32 * 1024)
@@ -427,6 +438,96 @@ class ZstdDictSpec extends AnyFlatSpec {
       zis.close
       assert(input.toSeq == output.toSeq)
     }
+
+    it should s"keep a fast dict alive while it is used by a ZstdInputStream with legacy $legacy" in {
+      val cdict = new ZstdDictCompress(dict, 0, dict.length, 1)
+      val compressed = compressWithDict(cdict)
+      cdict.close
+
+      val ddict = new ZstdDictDecompress(dict)
+      val zis   = new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(compressed))
+      zis.setDict(ddict)
+      // the stream references the native DDict, so freeing it while the
+      // stream is still open must be refused (use after free otherwise)
+      intercept[IllegalStateException] {
+        ddict.close
+      }
+      val output = readFully(zis)
+      zis.close
+      assert(input.toSeq == output.toSeq)
+      // closing the stream releases the dict
+      ddict.close
+    }
+
+    it should s"release the previous fast dict when a ZstdInputStream switches dicts with legacy $legacy" in {
+      val cdict2 = new ZstdDictCompress(dict2, 0, dict2.length, 1)
+      val compressed = compressWithDict(cdict2)
+      cdict2.close
+
+      val ddict  = new ZstdDictDecompress(dict)
+      val ddict2 = new ZstdDictDecompress(dict2)
+      val zis    = new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(compressed))
+      zis.setDict(ddict)
+      zis.setDict(ddict2)
+      // the first dict is no longer referenced by the stream
+      ddict.close
+      // the active one is still in use
+      intercept[IllegalStateException] {
+        ddict2.close
+      }
+      val output = readFully(zis)
+      zis.close
+      ddict2.close
+      assert(input.toSeq == output.toSeq)
+    }
+
+    it should s"keep a fast dict alive while it is used by a ZstdOutputStream with legacy $legacy" in {
+      val cdict = new ZstdDictCompress(dict, 0, dict.length, 1)
+      val os    = new ByteArrayOutputStream()
+      val zos   = new ZstdOutputStreamNoFinalizer(os, 1)
+      zos.setDict(cdict)
+      // the stream references the native CDict, so freeing it while the
+      // stream is still open must be refused (use after free otherwise)
+      intercept[IllegalStateException] {
+        cdict.close
+      }
+      zos.write(input)
+      zos.close
+      // closing the stream releases the dict
+      cdict.close
+      val compressed = os.toByteArray
+      assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(dict))
+
+      val ddict = new ZstdDictDecompress(dict)
+      val decompressed = Zstd.decompress(compressed, ddict, input.length)
+      ddict.close
+      assert(input.toSeq == decompressed.toSeq)
+    }
+
+    it should s"release the previous fast dict when a ZstdOutputStream switches dicts with legacy $legacy" in {
+      val cdict  = new ZstdDictCompress(dict, 0, dict.length, 1)
+      val cdict2 = new ZstdDictCompress(dict2, 0, dict2.length, 1)
+      val os     = new ByteArrayOutputStream()
+      val zos    = new ZstdOutputStreamNoFinalizer(os, 1)
+      zos.setDict(cdict)
+      zos.setDict(cdict2)
+      // the first dict is no longer referenced by the stream
+      cdict.close
+      // the active one is still in use
+      intercept[IllegalStateException] {
+        cdict2.close
+      }
+      zos.write(input)
+      zos.close
+      cdict2.close
+      val compressed = os.toByteArray
+      assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(dict2))
+
+      val ddict2 = new ZstdDictDecompress(dict2)
+      val decompressed = Zstd.decompress(compressed, ddict2, input.length)
+      ddict2.close
+      assert(input.toSeq == decompressed.toSeq)
+    }
   }
 
   // offset/length pairs that point outside of a 16 bytes dictionary buffer
@@ -494,5 +595,66 @@ class ZstdDictSpec extends AnyFlatSpec {
     ddict.close
     assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(dict))
     assert(input.toSeq == decompressed.toSeq)
+  }
+
+  "ZstdInputStreamNoFinalizer" should "refuse to configure a closed stream" in {
+    val dict  = train(false, 512)
+    val ddict = new ZstdDictDecompress(dict)
+    val zis   = new ZstdInputStreamNoFinalizer(new ByteArrayInputStream(Array[Byte]()))
+    zis.setDict(ddict)
+    zis.close
+    // the native stream has been freed, none of these may reach it
+    val setters: List[(String, () => Any)] = List(
+      "setDict(byte[])"             -> (() => zis.setDict(dict)),
+      "setDict(ZstdDictDecompress)" -> (() => zis.setDict(ddict)),
+      "setLongMax"                  -> (() => zis.setLongMax(20)),
+      "setRefMultipleDDicts"        -> (() => zis.setRefMultipleDDicts(true))
+    )
+    for ((name, setter) <- setters) {
+      val e = intercept[IOException] {
+        setter()
+      }
+      assert(e.getMessage == "Stream closed", s"$name on a closed stream")
+    }
+    // closing the stream released the dict and the refused setDict did not acquire it again
+    ddict.close
+  }
+
+  "ZstdOutputStreamNoFinalizer" should "refuse to configure a closed stream" in {
+    val dict  = train(false, 512)
+    val cdict = new ZstdDictCompress(dict, 1)
+    val zos   = new ZstdOutputStreamNoFinalizer(new ByteArrayOutputStream(), 1)
+    zos.setCloseFrameOnFlush(true)
+    zos.setDict(cdict)
+    zos.write(input, 0, 1024)
+    // flushing closes the frame, so after close() only the closed-stream check
+    // stands between the setters and the freed native stream
+    zos.flush
+    zos.close
+    val setters: List[(String, () => Any)] = List(
+      "setChecksum"               -> (() => zos.setChecksum(true)),
+      "setLevel"                  -> (() => zos.setLevel(3)),
+      "setLong"                   -> (() => zos.setLong(20)),
+      "setWorkers"                -> (() => zos.setWorkers(0)),
+      "setOverlapLog"             -> (() => zos.setOverlapLog(0)),
+      "setJobSize"                -> (() => zos.setJobSize(0)),
+      "setTargetLength"           -> (() => zos.setTargetLength(0)),
+      "setMinMatch"               -> (() => zos.setMinMatch(4)),
+      "setSearchLog"              -> (() => zos.setSearchLog(1)),
+      "setChainLog"               -> (() => zos.setChainLog(10)),
+      "setHashLog"                -> (() => zos.setHashLog(10)),
+      "setWindowLog"              -> (() => zos.setWindowLog(20)),
+      "setStrategy"               -> (() => zos.setStrategy(1)),
+      "setDict(byte[])"           -> (() => zos.setDict(dict)),
+      "setDict(ZstdDictCompress)" -> (() => zos.setDict(cdict))
+    )
+    for ((name, setter) <- setters) {
+      val e = intercept[IOException] {
+        setter()
+      }
+      assert(e.getMessage == "StreamClosed", s"$name on a closed stream")
+    }
+    // closing the stream released the dict and the refused setDict did not acquire it again
+    cdict.close
   }
 }
