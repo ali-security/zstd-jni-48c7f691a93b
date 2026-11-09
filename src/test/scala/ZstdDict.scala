@@ -428,4 +428,71 @@ class ZstdDictSpec extends AnyFlatSpec {
       assert(input.toSeq == output.toSeq)
     }
   }
+
+  // offset/length pairs that point outside of a 16 bytes dictionary buffer
+  val shortDict = new Array[Byte](16)
+  val invalidDictRanges = List(
+    (0, 17),             // one byte past the end
+    (8, 9),              // offset + length past the end
+    (0, 50000000),       // far past the end
+    (-8, 8),             // negative offset, before the start
+    (0, -1),             // negative length
+    (17, 0),             // offset past the end
+    (Int.MaxValue, 2)    // offset + length overflows
+  )
+
+  for ((offset, length) <- invalidDictRanges) {
+    "ZstdDictCompress" should s"reject out of bounds dictionary offset $offset and length $length" in {
+      intercept[IllegalArgumentException] {
+        new ZstdDictCompress(shortDict, offset, length, 1)
+      }
+    }
+
+    "ZstdDictDecompress" should s"reject out of bounds dictionary offset $offset and length $length" in {
+      intercept[IllegalArgumentException] {
+        new ZstdDictDecompress(shortDict, offset, length)
+      }
+    }
+  }
+
+  "ZstdDictCompress and ZstdDictDecompress" should "not read outside of the dictionary buffer in the native init" in {
+    val dict = train(false, 512)
+    val cdict = new ZstdDictCompress(dict, 1)
+    val ddict = new ZstdDictDecompress(dict)
+    try {
+      val cInit = classOf[ZstdDictCompress].getDeclaredMethod("init", classOf[Array[Byte]], classOf[Int], classOf[Int], classOf[Int])
+      val cPtr = classOf[ZstdDictCompress].getDeclaredField("nativePtr")
+      val dInit = classOf[ZstdDictDecompress].getDeclaredMethod("init", classOf[Array[Byte]], classOf[Int], classOf[Int])
+      val dPtr = classOf[ZstdDictDecompress].getDeclaredField("nativePtr")
+      cInit.setAccessible(true)
+      cPtr.setAccessible(true)
+      dInit.setAccessible(true)
+      dPtr.setAccessible(true)
+      val cdictPtr = cPtr.getLong(cdict)
+      val ddictPtr = dPtr.getLong(ddict)
+      for ((offset, length) <- invalidDictRanges) {
+        cInit.invoke(cdict, shortDict, Integer.valueOf(offset), Integer.valueOf(length), Integer.valueOf(1))
+        assert(cPtr.getLong(cdict) == cdictPtr, s"native ZstdDictCompress.init accepted offset $offset and length $length")
+        dInit.invoke(ddict, shortDict, Integer.valueOf(offset), Integer.valueOf(length))
+        assert(dPtr.getLong(ddict) == ddictPtr, s"native ZstdDictDecompress.init accepted offset $offset and length $length")
+      }
+    } finally {
+      cdict.close
+      ddict.close
+    }
+  }
+
+  it should "round-trip with a valid sub-range of a larger dictionary buffer" in {
+    val dict = train(false, 512)
+    val padded = new Array[Byte](dict.length + 13)
+    System.arraycopy(dict, 0, padded, 7, dict.length)
+    val cdict = new ZstdDictCompress(padded, 7, dict.length, 1)
+    val compressed = Zstd.compress(input, cdict)
+    cdict.close
+    val ddict = new ZstdDictDecompress(padded, 7, dict.length)
+    val decompressed = Zstd.decompress(compressed, ddict, input.length)
+    ddict.close
+    assert(Zstd.getDictIdFromFrame(compressed) == Zstd.getDictIdFromDict(dict))
+    assert(input.toSeq == decompressed.toSeq)
+  }
 }

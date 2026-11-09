@@ -21,6 +21,8 @@ JNIEXPORT void JNICALL Java_com_github_luben_zstd_ZstdDictCompress_init
     jclass clazz = (*env)->GetObjectClass(env, obj);
     compress_dict = (*env)->GetFieldID(env, clazz, "nativePtr", "J");
     if (NULL == dict) return;
+    jsize dict_len = (*env)->GetArrayLength(env, dict);
+    if (dict_offset < 0 || dict_size < 0 || dict_size > dict_len - dict_offset) return;
     void *dict_buff = (*env)->GetPrimitiveArrayCritical(env, dict, NULL);
     if (NULL == dict_buff) return;
     ZSTD_CDict* cdict = ZSTD_createCDict(((char *)dict_buff) + dict_offset, dict_size, level);
@@ -77,6 +79,8 @@ JNIEXPORT void JNICALL Java_com_github_luben_zstd_ZstdDictDecompress_init
     jclass clazz = (*env)->GetObjectClass(env, obj);
     decompress_dict = (*env)->GetFieldID(env, clazz, "nativePtr", "J");
     if (NULL == dict) return;
+    jsize dict_len = (*env)->GetArrayLength(env, dict);
+    if (dict_offset < 0 || dict_size < 0 || dict_size > dict_len - dict_offset) return;
     void *dict_buff = (*env)->GetPrimitiveArrayCritical(env, dict, NULL);
     if (NULL == dict_buff) return;
 
