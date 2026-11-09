@@ -5,6 +5,7 @@ import java.io.FilterInputStream;
 import java.io.IOException;
 import java.lang.IndexOutOfBoundsException;
 import java.nio.ByteBuffer;
+import java.util.LinkedList;
 
 import com.github.luben.zstd.util.Native;
 
@@ -37,8 +38,12 @@ public class ZstdInputStreamNoFinalizer extends FilterInputStream {
     private boolean isContinuous = false;
     private boolean frameFinished = true;
     private boolean isClosed = false;
-    // the currently used fast dict, kept alive (and its shared lock held) while the stream references it
-    private ZstdDictDecompress active_dict = null;
+    // Set once multiple dict references get enabled. The native stream keeps referencing every dict
+    // registered while they are enabled until the stream is freed (disabling them again does not drop
+    // the registered dicts), so from then on all dicts are kept alive until the stream is closed.
+    private boolean isMultiDict = false;
+    // the fast dict(s) used by the stream, kept alive (and their shared lock held) while the stream references them
+    private LinkedList<ZstdDictDecompress> active_dicts = new LinkedList<ZstdDictDecompress>();
 
     /* JNI methods */
     public static native long recommendedDInSize();
@@ -108,12 +113,12 @@ public class ZstdInputStreamNoFinalizer extends FilterInputStream {
             dict.releaseSharedLock();
             throw new ZstdIOException(size);
         }
-        // release the shared lock on the previously used dict (if any)
-        if (active_dict != null) {
-            active_dict.releaseSharedLock();
+        // release the shared lock on the previously used dict if not using multiple dicts (if any)
+        if (!active_dicts.isEmpty() && !isMultiDict) {
+            active_dicts.removeLast().releaseSharedLock();
         }
         // keep the dict alive so it's not garbage collected
-        active_dict = dict;
+        active_dicts.addFirst(dict);
         return this;
     }
 
@@ -135,6 +140,11 @@ public class ZstdInputStreamNoFinalizer extends FilterInputStream {
         int size = Zstd.setRefMultipleDDicts(stream, useMultiple);
         if (Zstd.isError(size)) {
             throw new ZstdIOException(size);
+        }
+        // the dicts registered while multiple dict references are enabled stay referenced by the
+        // native stream until it is freed, so they must not be released before close
+        if (useMultiple) {
+            isMultiDict = true;
         }
         return this;
     }
@@ -279,9 +289,8 @@ public class ZstdInputStreamNoFinalizer extends FilterInputStream {
         if (isClosed) {
             return;
         }
-        if (active_dict != null) {
-            active_dict.releaseSharedLock();
-            active_dict = null;
+        while (active_dicts.size() > 0) {
+            active_dicts.removeLast().releaseSharedLock();
         }
         isClosed = true;
         bufferPool.release(srcByteBuffer);

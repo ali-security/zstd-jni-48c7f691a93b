@@ -61,6 +61,10 @@ public class ZstdDirectBufferCompressingStreamNoFinalizer implements Closeable, 
             throw new IllegalStateException("Change of parameter on initialized stream");
         }
         this.dict = dict;
+        // release the shared lock on the previously set fast dict (if any)
+        if (this.fastDict != null) {
+            this.fastDict.releaseSharedLock();
+        }
         this.fastDict = null;
         return this;
     }
@@ -70,6 +74,11 @@ public class ZstdDirectBufferCompressingStreamNoFinalizer implements Closeable, 
             throw new IllegalStateException("Change of parameter on initialized stream");
         }
         this.dict = null;
+        // the shared lock on the dict is held until the stream is closed (or another dict is set)
+        dict.acquireSharedLock();
+        if (this.fastDict != null) {
+            this.fastDict.releaseSharedLock();
+        }
         this.fastDict = dict;
         return this;
     }
@@ -85,12 +94,7 @@ public class ZstdDirectBufferCompressingStreamNoFinalizer implements Closeable, 
             long result = 0;
             ZstdDictCompress fastDict = this.fastDict;
             if (fastDict != null) {
-                fastDict.acquireSharedLock();
-                try {
-                    result = initCStreamWithFastDict(stream, fastDict);
-                } finally {
-                    fastDict.releaseSharedLock();
-                }
+                result = initCStreamWithFastDict(stream, fastDict);
             } else if (dict != null) {
                 result = initCStreamWithDict(stream, dict, dict.length, level);
             } else {
@@ -173,6 +177,11 @@ public class ZstdDirectBufferCompressingStreamNoFinalizer implements Closeable, 
                 closed = true;
                 initialized = false;
                 target = null; // help GC with realizing the buffer can be released
+                if (fastDict != null) {
+                    fastDict.releaseSharedLock();
+                }
+                fastDict = null;
+                dict = null;
             }
         }
     }
